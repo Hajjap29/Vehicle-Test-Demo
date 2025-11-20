@@ -70,7 +70,8 @@ def call_gemini_api(mime_type, b64_data, api_key):
     """
     Calls the Gemini 1.5 Flash API via REST.
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
+    # FIX: Changed v1beta to v1 to correctly call the Gemini 1.5 Flash model
+    url = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={api_key}"
     
     headers = {
         "Content-Type": "application/json"
