@@ -82,13 +82,14 @@ def call_gemini_api(mime_type, b64_data, api_key):
     """
     Calls the Gemini 1.5 Flash API via REST.
     """
-    url = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={api_key}"
+    # FIXED: Use v1beta API which supports responseSchema
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
     
     headers = {
         "Content-Type": "application/json"
     }
     
-    # FIXED: Changed "config" to "generationConfig"
+    # Use v1beta format
     body = {
         "contents": [{
             "parts": [
@@ -102,8 +103,8 @@ def call_gemini_api(mime_type, b64_data, api_key):
             ]
         }],
         "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": RESPONSE_SCHEMA
+            "response_mime_type": "application/json",
+            "response_schema": RESPONSE_SCHEMA
         }
     }
 
