@@ -3,7 +3,7 @@ import base64
 import json
 import requests
 import os
-import pandas as pd # <-- Added import for plotting
+import pandas as pd
 
 # --- Page Config ---
 st.set_page_config(
@@ -166,21 +166,26 @@ def calculate_detailed_emissions(detection, miles_per_year, years):
     if not cfg or cfg.get("lifetime_tons_min") is None:
         return None
 
+    # Calculate mid-point total lifetime based on category
     mid_lifetime = (cfg["lifetime_tons_min"] + cfg["lifetime_tons_max"]) / 2.0
-    manufacturing = mid_lifetime * 0.3
-    use_phase_total_base = mid_lifetime * 0.7 # 70% of total estimated lifetime CO2e
     
-    lifetime_miles = miles_per_year * years
-    if lifetime_miles <= 0:
-        return None
-        
-    per_mile_tons = use_phase_total_base / lifetime_miles
+    # Base assumptions: 30% manufacturing, 70% use phase over default lifetime (12 years, 12000 miles/yr)
+    manufacturing = mid_lifetime * 0.3
+    use_phase_total_base = mid_lifetime * 0.7 
+    
+    lifetime_miles_default = 12000 * 12 # Default lifetime miles used to set the base per-mile rate
+    
+    # Calculate per-mile carbon rate based on the base use-phase total
+    per_mile_tons = use_phase_total_base / lifetime_miles_default 
+    
+    # Calculate emissions for the user's specific input profile
     annual_emissions = per_mile_tons * miles_per_year
-    total_lifetime_calculated = manufacturing + (annual_emissions * years)
+    total_use_phase_calculated = annual_emissions * years
+    total_lifetime_calculated = manufacturing + total_use_phase_calculated
     
     return {
         "manufacturing": manufacturing,
-        "use_phase_total_base": use_phase_total_base, # Used for charting the lifetime comparison
+        "total_use_phase_calculated": total_use_phase_calculated, # New dynamic value for charting
         "annual_emissions": annual_emissions,
         "total_lifetime": total_lifetime_calculated,
         "per_mile_g": per_mile_tons * 1e6
@@ -268,10 +273,10 @@ if 'detection' in st.session_state:
         )
 
         # 2. Prepare data for bar chart
-        # Using the base use-phase total (70% of mid-point estimate) for clear comparison.
+        # The 'total_use_phase_calculated' is now dynamic, reflecting user inputs.
         chart_data = pd.DataFrame({
-            "Category": ["Manufacturing (30%)", "Fuel/Energy Use (70% Base)"],
-            "CO2e Tons": [detailed['manufacturing'], detailed['use_phase_total_base']]
+            "Category": ["Manufacturing", "Use Phase (Calculated)"],
+            "CO2e Tons": [detailed['manufacturing'], detailed['total_use_phase_calculated']]
         })
         
         # 3. Display Bar Chart
