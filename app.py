@@ -174,17 +174,16 @@ st.title("🚗 AI Car Carbon Estimator")
 st.caption("Powered by Google Gemini 1.5 Flash")
 st.markdown("Upload a photo of a vehicle to detect its model and estimate its lifecycle carbon footprint.")
 
-# 1. API Key Check
+# 1. API Key Check (Developer Side Only)
 api_key = get_api_key()
 if not api_key:
-    st.warning("⚠️ Google API Key not found.")
-    api_key = st.text_input("Enter Google API Key:", type="password")
-    st.markdown("[Get a Google API Key](https://aistudio.google.com/app/apikey)")
+    st.error("⚠️ Application Configuration Error: API Key not found. The application owner must set the GOOGLE_API_KEY secret.")
+    st.stop()
 
 # 2. File Upload
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "webp"])
 
-if uploaded_file and api_key:
+if uploaded_file:
     # Display Image
     st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
     
