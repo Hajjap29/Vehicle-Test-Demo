@@ -6,37 +6,27 @@ import os
 
 # --- Page Config ---
 st.set_page_config(
-    page_title="Car Carbon Estimator (Gemini)",
+    page_title="Car Carbon Estimator",
     page_icon="🚗",
     layout="centered"
 )
 
 # --- Constants & Configuration ---
-MODEL = "gemini-1.5-flash"
+MODEL = "gpt-4o-mini"
+API_URL = "https://api.openai.com/v1/chat/completions"
 
-# Define the structure for the JSON response
-RESPONSE_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "make": {"type": "string", "description": "The manufacturer of the vehicle."},
-        "model": {"type": "string", "description": "The specific model name of the vehicle."},
-        "year_range": {"type": "string", "description": "The estimated model year range (e.g., '2016-2020')."},
-        "vehicle_class": {
-            "type": "string", 
-            "enum": ["compact", "midsize", "fullsize", "suv", "pickup", "van", "motorcycle", "bus", "truck", "unknown"],
-            "description": "The determined classification of the vehicle type."
-        },
-        "powertrain": {
-            "type": "string",
-            "enum": ["gasoline", "diesel", "hybrid", "plug-in hybrid", "electric", "unknown"],
-            "description": "The likely powertrain type based on model and image (e.g., EV badge)."
-        },
-        "confidence": {"type": "number", "description": "A score between 0 and 1 indicating certainty of identification."}
-    },
-    "required": ["make", "model", "vehicle_class", "powertrain", "confidence"]
-}
+PROMPT_JSON = """
+You are an image-understanding assistant. I will provide an image. 
+Respond ONLY with JSON (no extra text). The JSON must have the following keys:
+- make: string or null
+- model: string or null
+- year_range: string or null (e.g., "2016-2020")
+- vehicle_class: one of ["compact", "midsize", "fullsize", "suv", "pickup", "van", "motorcycle", "bus", "truck", "unknown"]
+- powertrain: one of ["gasoline", "diesel", "hybrid", "plug-in hybrid", "electric", "unknown"]
+- confidence: number between 0 and 1 (estimate of how confident you are)
 
-PROMPT_TEXT = "Analyze this image of a vehicle and return the identification results strictly following the provided JSON schema."
+Make conservative guesses. If uncertain, put null or "unknown". Don't output any explanatory text — ONLY the JSON object.
+"""
 
 CARBON_TABLE = {
     "compact":    {"lifetime_tons_min": 30, "lifetime_tons_max": 50},
@@ -55,83 +45,106 @@ CARBON_TABLE = {
 
 def get_api_key():
     """
-    Checks for GOOGLE_API_KEY in secrets or environment variables.
+    Tries to get API key from Streamlit secrets first, then environment variables.
     """
     try:
-        return st.secrets["GOOGLE_API_KEY"]
+        return st.secrets["OPENAI_API_KEY"]
     except (FileNotFoundError, KeyError):
-        return os.getenv("GOOGLE_API_KEY")
+        return os.getenv("OPENAI_API_KEY")
 
-def process_image(uploaded_file):
+def encode_image_from_buffer(uploaded_file):
     """
-    Returns the mime type and raw base64 string required by Gemini.
+    Encodes a Streamlit UploadedFile (BytesIO) to base64 string.
     """
     bytes_data = uploaded_file.getvalue()
-    b64_string = base64.b64encode(bytes_data).decode("utf-8")
-    
+    b64 = base64.b64encode(bytes_data).decode("utf-8")
     # Determine mime type
     mime = "image/jpeg"
     if uploaded_file.type == "image/png":
         mime = "image/png"
     elif uploaded_file.type == "image/webp":
         mime = "image/webp"
-        
-    return mime, b64_string
+    return f"data:{mime};base64,{b64}"
 
-def call_gemini_api(mime_type, b64_data, api_key):
-    """
-    Calls the Gemini 1.5 Flash API via REST.
-    """
-    # FIXED: Use v1beta API which supports responseSchema
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
-    
+def call_vision_api(data_uri, api_key):
     headers = {
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    
-    # Use v1beta format
     body = {
-        "contents": [{
-            "parts": [
-                {"text": PROMPT_TEXT},
-                {
-                    "inline_data": {
-                        "mime_type": mime_type,
-                        "data": b64_data
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PROMPT_JSON},
+                    {
+                        "type": "image_url", 
+                        "image_url": {
+                            "url": data_uri
+                        }
                     }
-                }
-            ]
-        }],
-        "generationConfig": {
-            "response_mime_type": "application/json",
-            "response_schema": RESPONSE_SCHEMA
-        }
+                ],
+            }
+        ],
+        "max_tokens": 300
     }
-
     try:
-        resp = requests.post(url, headers=headers, json=body, timeout=60)
+        resp = requests.post(API_URL, headers=headers, json=body, timeout=60)
         resp.raise_for_status()
         return resp.json()
     except requests.exceptions.RequestException as e:
+        # Return the response content if available to help debug
         error_details = ""
         if hasattr(e, 'response') and e.response is not None:
             error_details = f" - {e.response.text}"
         return {"error": str(e) + error_details}
 
-def extract_json_from_gemini(resp_json):
+def extract_json_from_response(resp_json):
     """
-    Parses the Gemini response structure.
+    Robustly extracts JSON from the API response.
     """
+    candidates = []
+    
+    # Check for errors first
     if "error" in resp_json:
         return {"error": resp_json["error"]}
 
+    # 1. Check 'output' (standard pattern in some libs)
     try:
-        # Gemini response path: candidates[0] -> content -> parts[0] -> text
-        raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-        # The model should return only the JSON string when a schema is provided
-        return json.loads(raw_text)
-    except (KeyError, IndexError, json.JSONDecodeError) as e:
-        return {"error": f"Failed to parse API response: {str(e)}", "raw_response": resp_json}
+        if isinstance(resp_json.get("output"), list):
+            for item in resp_json.get("output", []):
+                if item.get("type") == "message":
+                    for c in item.get("content", []):
+                        if isinstance(c, dict):
+                            txt = c.get("text") or c.get("content")
+                            if isinstance(txt, str):
+                                candidates.append(txt)
+    except Exception:
+        pass
+
+    # 2. Standard OpenAI 'choices' pattern
+    if not candidates and "choices" in resp_json:
+        try:
+            choice_msg = resp_json["choices"][0].get("message", {}).get("content")
+            if isinstance(choice_msg, str):
+                candidates.append(choice_msg)
+        except Exception:
+            pass
+            
+    full_text = "\n".join(candidates)
+    
+    # Attempt to find JSON object
+    decoder = json.JSONDecoder()
+    for i in range(len(full_text)):
+        try:
+            obj, idx = decoder.raw_decode(full_text[i:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    return {"raw_text": full_text, "error": "No valid JSON object found in response"}
 
 def estimate_carbon(detection):
     cls = detection.get("vehicle_class", "unknown")
@@ -186,49 +199,47 @@ def calculate_detailed_emissions(detection, miles_per_year, years):
 # --- Main App Layout ---
 
 st.title("🚗 AI Car Carbon Estimator")
-st.caption("Powered by Google Gemini 1.5 Flash")
 st.markdown("Upload a photo of a vehicle to detect its model and estimate its lifecycle carbon footprint.")
 
 # 1. API Key Check
 api_key = get_api_key()
 if not api_key:
-    st.error("⚠️ Application Configuration Error: API Key not found. The application owner must set the GOOGLE_API_KEY secret.")
-    st.stop()
+    st.warning("⚠️ OpenAI API Key not found.")
+    api_key = st.text_input("Enter OpenAI API Key:", type="password")
 
 # 2. File Upload
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "webp"])
 
-if uploaded_file:
+if uploaded_file and api_key:
     # Display Image
-    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
+    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
     
     if st.button("Analyze Vehicle"):
-        with st.spinner("Analyzing image with Gemini AI..."):
+        with st.spinner("Analyzing image with AI..."):
             # Encode
-            mime_type, b64_data = process_image(uploaded_file)
+            data_uri = encode_image_from_buffer(uploaded_file)
             
             # Call API
-            api_response = call_gemini_api(mime_type, b64_data, api_key)
+            api_response = call_vision_api(data_uri, api_key)
             
             # Parse
-            detection = extract_json_from_gemini(api_response)
+            detection = extract_json_from_response(api_response)
             
             if "error" in detection:
                 st.error(f"Analysis Failed: {detection['error']}")
-                if "raw_response" in detection:
-                    st.json(detection["raw_response"])
             else:
                 st.success("Vehicle Detected!")
                 
-                # Save to session state
+                # Save to session state so it persists if we change inputs below
                 st.session_state['detection'] = detection
                 st.session_state['carbon_est'] = estimate_carbon(detection)
 
-# 3. Display Results
+# 3. Display Results (if available in session state)
 if 'detection' in st.session_state:
     det = st.session_state['detection']
     est = st.session_state['carbon_est']
     
+    # Columns for details
     col1, col2 = st.columns(2)
     
     with col1:
@@ -250,6 +261,7 @@ if 'detection' in st.session_state:
     st.markdown("---")
     st.subheader("📉 Refine Estimate")
     
+    # Inputs for refinement
     miles = st.number_input("Miles driven per year", value=12000, step=1000)
     years = st.number_input("Years of ownership", value=12, step=1)
     
