@@ -15,16 +15,32 @@ st.set_page_config(
 # We use Gemini 1.5 Flash for fast vision processing
 MODEL = "gemini-1.5-flash"
 
-PROMPT_TEXT = """
-Analyze this image of a vehicle.
-Respond ONLY with a JSON object containing these keys:
-- make: string or null
-- model: string or null
-- year_range: string or null (e.g., "2016-2020")
-- vehicle_class: one of ["compact", "midsize", "fullsize", "suv", "pickup", "van", "motorcycle", "bus", "truck", "unknown"]
-- powertrain: one of ["gasoline", "diesel", "hybrid", "plug-in hybrid", "electric", "unknown"]
-- confidence: number between 0 and 1
-"""
+# Define the structure for the JSON response
+# This schema ensures the model returns valid, usable data.
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "make": {"type": "string", "description": "The manufacturer of the vehicle."},
+        "model": {"type": "string", "description": "The specific model name of the vehicle."},
+        "year_range": {"type": "string", "description": "The estimated model year range (e.g., '2016-2020')."},
+        "vehicle_class": {
+            "type": "string", 
+            "enum": ["compact", "midsize", "fullsize", "suv", "pickup", "van", "motorcycle", "bus", "truck", "unknown"],
+            "description": "The determined classification of the vehicle type."
+        },
+        "powertrain": {
+            "type": "string",
+            "enum": ["gasoline", "diesel", "hybrid", "plug-in hybrid", "electric", "unknown"],
+            "description": "The likely powertrain type based on model and image (e.g., EV badge)."
+        },
+        "confidence": {"type": "number", "description": "A score between 0 and 1 indicating certainty of identification."}
+    },
+    "required": ["make", "model", "vehicle_class", "powertrain", "confidence"]
+}
+
+# The prompt now just asks the model to use the schema, no more instructing on keys.
+PROMPT_TEXT = "Analyze this image of a vehicle and return the identification results strictly following the provided JSON schema."
+
 
 CARBON_TABLE = {
     "compact":    {"lifetime_tons_min": 30, "lifetime_tons_max": 50},
@@ -70,7 +86,7 @@ def call_gemini_api(mime_type, b64_data, api_key):
     """
     Calls the Gemini 1.5 Flash API via REST.
     """
-    # FIX: Changed v1beta to v1 to correctly call the Gemini 1.5 Flash model
+    # Using v1 endpoint
     url = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={api_key}"
     
     headers = {
@@ -90,8 +106,10 @@ def call_gemini_api(mime_type, b64_data, api_key):
                 }
             ]
         }],
-        "generationConfig": {
-            "response_mime_type": "application/json"
+        "config": { # Use 'config' for the outer structure, as per documentation for this endpoint
+            # FIX: Use response_schema and response_mime_type (for v1)
+            "response_mime_type": "application/json",
+            "response_schema": RESPONSE_SCHEMA
         }
     }
 
@@ -115,6 +133,7 @@ def extract_json_from_gemini(resp_json):
     try:
         # Gemini response path: candidates[0] -> content -> parts[0] -> text
         raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        # The model should return *only* the JSON string when a schema is provided
         return json.loads(raw_text)
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         return {"error": f"Failed to parse API response: {str(e)}", "raw_response": resp_json}
