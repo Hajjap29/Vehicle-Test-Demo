@@ -12,11 +12,9 @@ st.set_page_config(
 )
 
 # --- Constants & Configuration ---
-# We use Gemini 1.5 Flash for fast vision processing
 MODEL = "gemini-1.5-flash"
 
 # Define the structure for the JSON response
-# This schema ensures the model returns valid, usable data.
 RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -38,9 +36,7 @@ RESPONSE_SCHEMA = {
     "required": ["make", "model", "vehicle_class", "powertrain", "confidence"]
 }
 
-# The prompt now just asks the model to use the schema, no more instructing on keys.
 PROMPT_TEXT = "Analyze this image of a vehicle and return the identification results strictly following the provided JSON schema."
-
 
 CARBON_TABLE = {
     "compact":    {"lifetime_tons_min": 30, "lifetime_tons_max": 50},
@@ -86,14 +82,13 @@ def call_gemini_api(mime_type, b64_data, api_key):
     """
     Calls the Gemini 1.5 Flash API via REST.
     """
-    # Using v1 endpoint
     url = f"https://generativelanguage.googleapis.com/v1/models/{MODEL}:generateContent?key={api_key}"
     
     headers = {
         "Content-Type": "application/json"
     }
     
-    # Gemini Payload Structure
+    # FIXED: Changed "config" to "generationConfig"
     body = {
         "contents": [{
             "parts": [
@@ -106,10 +101,9 @@ def call_gemini_api(mime_type, b64_data, api_key):
                 }
             ]
         }],
-        "config": { # Use 'config' for the outer structure, as per documentation for this endpoint
-            # FIX: Use response_schema and response_mime_type (for v1)
-            "response_mime_type": "application/json",
-            "response_schema": RESPONSE_SCHEMA
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": RESPONSE_SCHEMA
         }
     }
 
@@ -133,7 +127,7 @@ def extract_json_from_gemini(resp_json):
     try:
         # Gemini response path: candidates[0] -> content -> parts[0] -> text
         raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-        # The model should return *only* the JSON string when a schema is provided
+        # The model should return only the JSON string when a schema is provided
         return json.loads(raw_text)
     except (KeyError, IndexError, json.JSONDecodeError) as e:
         return {"error": f"Failed to parse API response: {str(e)}", "raw_response": resp_json}
@@ -194,7 +188,7 @@ st.title("🚗 AI Car Carbon Estimator")
 st.caption("Powered by Google Gemini 1.5 Flash")
 st.markdown("Upload a photo of a vehicle to detect its model and estimate its lifecycle carbon footprint.")
 
-# 1. API Key Check (Developer Side Only)
+# 1. API Key Check
 api_key = get_api_key()
 if not api_key:
     st.error("⚠️ Application Configuration Error: API Key not found. The application owner must set the GOOGLE_API_KEY secret.")
@@ -205,7 +199,7 @@ uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png
 
 if uploaded_file:
     # Display Image
-    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+    st.image(uploaded_file, caption="Uploaded Image", use_container_width=True)
     
     if st.button("Analyze Vehicle"):
         with st.spinner("Analyzing image with Gemini AI..."):
