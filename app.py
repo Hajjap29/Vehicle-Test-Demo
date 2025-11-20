@@ -4,28 +4,26 @@ import json
 import requests
 import os
 
-# --- Configuration ---
+# --- Page Config ---
 st.set_page_config(
-    page_title="Car Carbon AI", 
+    page_title="Car Carbon Estimator (Gemini)",
     page_icon="🚗",
-    layout="wide"
+    layout="centered"
 )
 
-# Constants
-MODEL = "gpt-4o-mini"
-API_URL = "https://api.openai.com/v1/chat/completions"
+# --- Constants & Configuration ---
+# We use Gemini 1.5 Flash for fast vision processing
+MODEL = "gemini-1.5-flash"
 
-PROMPT_JSON = """
-You are an image-understanding assistant. I will provide an image of a vehicle. 
-Respond ONLY with JSON (no extra text). The JSON must have the following keys:
+PROMPT_TEXT = """
+Analyze this image of a vehicle.
+Respond ONLY with a JSON object containing these keys:
 - make: string or null
 - model: string or null
 - year_range: string or null (e.g., "2016-2020")
 - vehicle_class: one of ["compact", "midsize", "fullsize", "suv", "pickup", "van", "motorcycle", "bus", "truck", "unknown"]
 - powertrain: one of ["gasoline", "diesel", "hybrid", "plug-in hybrid", "electric", "unknown"]
-- confidence: number between 0 and 1 (estimate of how confident you are)
-
-Make conservative guesses. If uncertain, put null or "unknown". Don't output any explanatory text — ONLY the JSON object.
+- confidence: number between 0 and 1
 """
 
 CARBON_TABLE = {
@@ -43,207 +41,211 @@ CARBON_TABLE = {
 
 # --- Helper Functions ---
 
-def encode_image(uploaded_file):
-    """Encodes the uploaded Streamlit file object to Base64."""
+def get_api_key():
+    """
+    Checks for GOOGLE_API_KEY in secrets or environment variables.
+    """
+    try:
+        return st.secrets["GOOGLE_API_KEY"]
+    except (FileNotFoundError, KeyError):
+        return os.getenv("GOOGLE_API_KEY")
+
+def process_image(uploaded_file):
+    """
+    Returns the mime type and raw base64 string required by Gemini.
+    """
     bytes_data = uploaded_file.getvalue()
-    b64 = base64.b64encode(bytes_data).decode('utf-8')
-    mime = uploaded_file.type
-    return f"data:{mime};base64,{b64}"
-
-def extract_json_from_response(resp_json):
-    """Robustly extracts JSON from OpenAI response."""
-    candidates = []
+    b64_string = base64.b64encode(bytes_data).decode("utf-8")
     
-    if "choices" in resp_json:
-        try:
-            choice_msg = resp_json["choices"][0].get("message", {}).get("content")
-            if choice_msg:
-                candidates.append(choice_msg)
-        except Exception:
-            pass
+    # Determine mime type
+    mime = "image/jpeg"
+    if uploaded_file.type == "image/png":
+        mime = "image/png"
+    elif uploaded_file.type == "image/webp":
+        mime = "image/webp"
+        
+    return mime, b64_string
 
-    if not candidates:
-        candidates.append(json.dumps(resp_json))
-
-    full_text = "\n".join(candidates)
+def call_gemini_api(mime_type, b64_data, api_key):
+    """
+    Calls the Gemini 1.5 Flash API via REST.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
     
-    decoder = json.JSONDecoder()
-    for i in range(len(full_text)):
-        try:
-            obj, idx = decoder.raw_decode(full_text[i:])
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            continue
-            
-    return {"raw_text": full_text, "error": "no JSON object found"}
-
-def call_vision_api(data_uri, api_key):
-    """Sends request to OpenAI Chat Completions API."""
     headers = {
-        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
     
-    payload = {
-        "model": MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": PROMPT_JSON},
-                    {"type": "image_url", "image_url": {"url": data_uri}}
-                ]
-            }
-        ],
-        "max_tokens": 300
+    # Gemini Payload Structure
+    body = {
+        "contents": [{
+            "parts": [
+                {"text": PROMPT_TEXT},
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": b64_data
+                    }
+                }
+            ]
+        }],
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        }
     }
 
     try:
-        resp = requests.post(API_URL, headers=headers, json=payload, timeout=60)
+        resp = requests.post(url, headers=headers, json=body, timeout=60)
         resp.raise_for_status()
         return resp.json()
     except requests.exceptions.RequestException as e:
-        st.error(f"API Connection Error: {e}")
-        return None
+        error_details = ""
+        if hasattr(e, 'response') and e.response is not None:
+            error_details = f" - {e.response.text}"
+        return {"error": str(e) + error_details}
+
+def extract_json_from_gemini(resp_json):
+    """
+    Parses the Gemini response structure.
+    """
+    if "error" in resp_json:
+        return {"error": resp_json["error"]}
+
+    try:
+        # Gemini response path: candidates[0] -> content -> parts[0] -> text
+        raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(raw_text)
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        return {"error": f"Failed to parse API response: {str(e)}", "raw_response": resp_json}
 
 def estimate_carbon(detection):
     cls = detection.get("vehicle_class", "unknown")
     powertrain = detection.get("powertrain", "unknown")
     cfg = CARBON_TABLE.get(cls, CARBON_TABLE["unknown"])
     
-    # EV Adjustment (Manufacturing higher, use phase lower)
-    if powertrain == "electric" and cls != "unknown" and cfg["lifetime_tons_min"] is not None:
-        min_est = max(0, int(cfg["lifetime_tons_min"] * 0.7))
-        max_est = int(cfg["lifetime_tons_max"] * 0.8)
-        return {"lifetime_min_tons": min_est, "lifetime_max_tons": max_est, "note": "EV estimate (adjusted for grid)"}
+    if cfg["lifetime_tons_min"] is None:
+        return {"note": "Unknown category"}
+
+    min_est = cfg["lifetime_tons_min"]
+    max_est = cfg["lifetime_tons_max"]
+    note = "Category-level estimate"
+
+    # Simple EV adjustment
+    if powertrain == "electric" and cls != "unknown":
+        min_est = max(0, int(min_est * 0.7))
+        max_est = int(max_est * 0.8)
+        note = "EV estimate; grid dependency not included"
         
     return {
-        "lifetime_min_tons": cfg["lifetime_tons_min"], 
-        "lifetime_max_tons": cfg["lifetime_tons_max"], 
-        "note": "Standard internal combustion estimate"
+        "lifetime_min_tons": min_est,
+        "lifetime_max_tons": max_est,
+        "note": note
     }
 
-def refined_estimate(detection, miles_per_year, years):
-    cls = (detection or {}).get("vehicle_class", "unknown")
+def calculate_detailed_emissions(detection, miles_per_year, years):
+    cls = detection.get("vehicle_class", "unknown")
     cfg = CARBON_TABLE.get(cls, {})
     
     if not cfg or cfg.get("lifetime_tons_min") is None:
         return None
 
     mid_lifetime = (cfg["lifetime_tons_min"] + cfg["lifetime_tons_max"]) / 2.0
-    # Rough heuristic: 30% emissions from manufacturing, 70% from driving
     manufacturing = mid_lifetime * 0.3
-    use_phase_total_lifetime = mid_lifetime * 0.7
+    use_phase_total = mid_lifetime * 0.7
     
-    # Calculate per-mile based on standard assumption (e.g. 150k lifetime miles)
-    assumed_lifetime_miles = 150000
-    per_mile_tons = use_phase_total_lifetime / assumed_lifetime_miles
-    
+    lifetime_miles = miles_per_year * years
+    if lifetime_miles <= 0:
+        return None
+        
+    per_mile_tons = use_phase_total / lifetime_miles
     annual_emissions = per_mile_tons * miles_per_year
-    total_estimate = manufacturing + (annual_emissions * years)
+    total_lifetime = manufacturing + (annual_emissions * years)
     
     return {
-        "manufacturing_tons": manufacturing,
-        "annual_tons": annual_emissions,
-        "total_lifetime_tons": total_estimate,
+        "manufacturing": manufacturing,
+        "annual_emissions": annual_emissions,
+        "total_lifetime": total_lifetime,
         "per_mile_g": per_mile_tons * 1e6
     }
 
-# --- Main UI Layout ---
+# --- Main App Layout ---
 
-st.title("🚗 Car Model & Carbon Recognition")
-st.markdown("""
-**Upload a photo of a vehicle.** AI will identify the Make/Model and estimate the carbon footprint over its lifetime.
-""")
+st.title("🚗 AI Car Carbon Estimator")
+st.caption("Powered by Google Gemini 1.5 Flash")
+st.markdown("Upload a photo of a vehicle to detect its model and estimate its lifecycle carbon footprint.")
 
-# --- 1. SECURE API KEY HANDLING ---
-# This looks for the key in Streamlit Secrets. 
-# It will NOT appear in the UI.
-api_key = None
-if "OPENAI_API_KEY" in st.secrets:
-    api_key = st.secrets["OPENAI_API_KEY"]
-else:
-    # Fallback for local testing if you have a .env file
-    try:
-        from dotenv import load_dotenv
-        load_dotenv()
-        api_key = os.getenv("OPENAI_API_KEY")
-    except ImportError:
-        pass
-
+# 1. API Key Check
+api_key = get_api_key()
 if not api_key:
-    st.error("🚨 **Configuration Error:** OpenAI API Key not found. Please set `OPENAI_API_KEY` in Streamlit Secrets.")
-    st.stop()
+    st.warning("⚠️ Google API Key not found.")
+    api_key = st.text_input("Enter Google API Key:", type="password")
+    st.markdown("[Get a Google API Key](https://aistudio.google.com/app/apikey)")
 
-# --- 2. APP LOGIC ---
-
+# 2. File Upload
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "webp"])
 
-if uploaded_file:
-    col1, col2 = st.columns([1, 1])
+if uploaded_file and api_key:
+    # Display Image
+    st.image(uploaded_file, caption="Uploaded Image", use_column_width=True)
+    
+    if st.button("Analyze Vehicle"):
+        with st.spinner("Analyzing image with Gemini AI..."):
+            # Encode
+            mime_type, b64_data = process_image(uploaded_file)
+            
+            # Call API
+            api_response = call_gemini_api(mime_type, b64_data, api_key)
+            
+            # Parse
+            detection = extract_json_from_gemini(api_response)
+            
+            if "error" in detection:
+                st.error(f"Analysis Failed: {detection['error']}")
+                if "raw_response" in detection:
+                    st.json(detection["raw_response"])
+            else:
+                st.success("Vehicle Detected!")
+                
+                # Save to session state
+                st.session_state['detection'] = detection
+                st.session_state['carbon_est'] = estimate_carbon(detection)
+
+# 3. Display Results
+if 'detection' in st.session_state:
+    det = st.session_state['detection']
+    est = st.session_state['carbon_est']
+    
+    col1, col2 = st.columns(2)
     
     with col1:
-        st.image(uploaded_file, caption="Your Upload", use_column_width=True)
-    
-    with col2:
-        st.subheader("Analysis Results")
-        analyze_btn = st.button("🔍 Identify Vehicle", type="primary")
-        
-        # Use session state to keep results visible when interacting with sliders later
-        if "detection_result" not in st.session_state:
-            st.session_state.detection_result = None
-            
-        if analyze_btn:
-            with st.spinner("Analyzing image features..."):
-                data_uri = encode_image(uploaded_file)
-                raw_resp = call_vision_api(data_uri, api_key)
-                
-                if raw_resp:
-                    parsed = extract_json_from_response(raw_resp)
-                    if "error" not in parsed:
-                        st.session_state.detection_result = parsed
-                    else:
-                        st.error("Could not identify vehicle. Please try a clearer image.")
-                        st.json(parsed)
+        st.subheader("🔍 Detection")
+        st.write(f"**Make:** {det.get('make', 'Unknown')}")
+        st.write(f"**Model:** {det.get('model', 'Unknown')}")
+        st.write(f"**Class:** {det.get('vehicle_class', 'Unknown')}")
+        st.write(f"**Powertrain:** {det.get('powertrain', 'Unknown')}")
+        st.metric("Confidence", f"{det.get('confidence', 0)*100:.0f}%")
 
-        # Display Results if they exist
-        result = st.session_state.detection_result
-        if result:
-            # Identity Metrics
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Make", result.get("make", "Unknown"))
-            m2.metric("Model", result.get("model", "Unknown"))
-            m3.metric("Year", result.get("year_range", "Unknown"))
-            
-            st.caption(f"Detected Class: {result.get('vehicle_class')} | Powertrain: {result.get('powertrain')}")
-            
-            st.divider()
-            
-            # Carbon Calculation
-            base_est = estimate_carbon(result)
-            if base_est["lifetime_min_tons"]:
-                st.subheader("🌍 Carbon Footprint")
-                st.write(f"Estimated Lifetime Emissions: **{base_est['lifetime_min_tons']} - {base_est['lifetime_max_tons']} tons CO₂e**")
-                
-                st.markdown("### 🧮 Personalize Estimate")
-                c1, c2 = st.columns(2)
-                miles = c1.number_input("Miles Driven / Year", value=12000, step=1000)
-                years = c2.number_input("Years of Ownership", value=10, step=1)
-                
-                refined = refined_estimate(result, miles, years)
-                
-                if refined:
-                    total = refined['total_lifetime_tons']
-                    st.success(f"**Your Projected Total: {total:.1f} tons CO₂e**")
-                    
-                    # Simple Chart
-                    chart_data = {
-                        "Category": ["Manufacturing (Fixed)", "Driving (Variable)"],
-                        "Emissions (Tons)": [refined["manufacturing_tons"], refined["annual_tons"] * years]
-                    }
-                    st.bar_chart(chart_data, x="Category", y="Emissions (Tons)")
-                    
-                    st.info(f"This is equivalent to **{refined['per_mile_g']:.0f} grams** of CO₂ emitted per mile.")
-            else:
-                st.warning("Carbon data unavailable for this specific vehicle type.")
+    with col2:
+        st.subheader("🌍 Carbon Estimate")
+        if "lifetime_min_tons" in est:
+            st.metric("Lifetime CO2e", f"{est['lifetime_min_tons']} - {est['lifetime_max_tons']} tons")
+            st.info(est['note'])
+        else:
+            st.warning("Could not estimate carbon for this vehicle class.")
+
+    st.markdown("---")
+    st.subheader("📉 Refine Estimate")
+    
+    miles = st.number_input("Miles driven per year", value=12000, step=1000)
+    years = st.number_input("Years of ownership", value=12, step=1)
+    
+    detailed = calculate_detailed_emissions(det, miles, years)
+    
+    if detailed:
+        st.markdown(f"### Estimated Breakdown over {years} years")
+        d_col1, d_col2, d_col3 = st.columns(3)
+        d_col1.metric("Manufacturing", f"{detailed['manufacturing']:.1f} tons")
+        d_col2.metric("Annual Use", f"{detailed['annual_emissions']:.1f} tons/yr")
+        d_col3.metric("Per Mile", f"{detailed['per_mile_g']:.0f} g/mile")
+        
+        st.progress(min(detailed['total_lifetime'] / 100, 1.0), text=f"Total Lifetime: {detailed['total_lifetime']:.1f} tons")
