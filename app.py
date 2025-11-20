@@ -3,6 +3,7 @@ import base64
 import json
 import requests
 import os
+import pandas as pd # <-- Added import for plotting
 
 # --- Page Config ---
 st.set_page_config(
@@ -15,6 +16,7 @@ st.set_page_config(
 MODEL = "gpt-4o-mini"
 API_URL = "https://api.openai.com/v1/chat/completions"
 
+# Note: The prompt remains focused on getting clean JSON data
 PROMPT_JSON = """
 You are an image-understanding assistant. I will provide an image. 
 Respond ONLY with JSON (no extra text). The JSON must have the following keys:
@@ -110,21 +112,8 @@ def extract_json_from_response(resp_json):
     if "error" in resp_json:
         return {"error": resp_json["error"]}
 
-    # 1. Check 'output' (standard pattern in some libs)
-    try:
-        if isinstance(resp_json.get("output"), list):
-            for item in resp_json.get("output", []):
-                if item.get("type") == "message":
-                    for c in item.get("content", []):
-                        if isinstance(c, dict):
-                            txt = c.get("text") or c.get("content")
-                            if isinstance(txt, str):
-                                candidates.append(txt)
-    except Exception:
-        pass
-
-    # 2. Standard OpenAI 'choices' pattern
-    if not candidates and "choices" in resp_json:
+    # Standard OpenAI 'choices' pattern
+    if "choices" in resp_json:
         try:
             choice_msg = resp_json["choices"][0].get("message", {}).get("content")
             if isinstance(choice_msg, str):
@@ -179,20 +168,21 @@ def calculate_detailed_emissions(detection, miles_per_year, years):
 
     mid_lifetime = (cfg["lifetime_tons_min"] + cfg["lifetime_tons_max"]) / 2.0
     manufacturing = mid_lifetime * 0.3
-    use_phase_total = mid_lifetime * 0.7
+    use_phase_total_base = mid_lifetime * 0.7 # 70% of total estimated lifetime CO2e
     
     lifetime_miles = miles_per_year * years
     if lifetime_miles <= 0:
         return None
         
-    per_mile_tons = use_phase_total / lifetime_miles
+    per_mile_tons = use_phase_total_base / lifetime_miles
     annual_emissions = per_mile_tons * miles_per_year
-    total_lifetime = manufacturing + (annual_emissions * years)
+    total_lifetime_calculated = manufacturing + (annual_emissions * years)
     
     return {
         "manufacturing": manufacturing,
+        "use_phase_total_base": use_phase_total_base, # Used for charting the lifetime comparison
         "annual_emissions": annual_emissions,
-        "total_lifetime": total_lifetime,
+        "total_lifetime": total_lifetime_calculated,
         "per_mile_g": per_mile_tons * 1e6
     }
 
@@ -203,6 +193,7 @@ st.markdown("Upload a photo of a vehicle to detect its model and estimate its li
 
 # 1. API Key Check
 api_key = get_api_key()
+# The app is designed for deployment with secrets, but includes an input for local testing.
 if not api_key:
     st.warning("⚠️ OpenAI API Key not found.")
     api_key = st.text_input("Enter OpenAI API Key:", type="password")
@@ -239,7 +230,7 @@ if 'detection' in st.session_state:
     det = st.session_state['detection']
     est = st.session_state['carbon_est']
     
-    # Columns for details
+    # Detection and Initial Estimate
     col1, col2 = st.columns(2)
     
     with col1:
@@ -251,27 +242,45 @@ if 'detection' in st.session_state:
         st.metric("Confidence", f"{det.get('confidence', 0)*100:.0f}%")
 
     with col2:
-        st.subheader("🌍 Carbon Estimate")
+        st.subheader("🌍 Initial Estimate")
         if "lifetime_min_tons" in est:
-            st.metric("Lifetime CO2e", f"{est['lifetime_min_tons']} - {est['lifetime_max_tons']} tons")
+            st.metric("Category Lifetime CO2e", f"{est['lifetime_min_tons']} - {est['lifetime_max_tons']} tons")
             st.info(est['note'])
         else:
             st.warning("Could not estimate carbon for this vehicle class.")
 
     st.markdown("---")
-    st.subheader("📉 Refine Estimate")
+    st.subheader("📉 Refined Emissions Breakdown")
     
     # Inputs for refinement
-    miles = st.number_input("Miles driven per year", value=12000, step=1000)
-    years = st.number_input("Years of ownership", value=12, step=1)
+    miles = st.number_input("Miles driven per year (miles)", value=12000, step=1000, key="miles_input")
+    years = st.number_input("Years of ownership", value=12, step=1, key="years_input")
     
     detailed = calculate_detailed_emissions(det, miles, years)
     
     if detailed:
-        st.markdown(f"### Estimated Breakdown over {years} years")
-        d_col1, d_col2, d_col3 = st.columns(3)
-        d_col1.metric("Manufacturing", f"{detailed['manufacturing']:.1f} tons")
-        d_col2.metric("Annual Use", f"{detailed['annual_emissions']:.1f} tons/yr")
-        d_col3.metric("Per Mile", f"{detailed['per_mile_g']:.0f} g/mile")
         
-        st.progress(min(detailed['total_lifetime'] / 100, 1.0), text=f"Total Lifetime: {detailed['total_lifetime']:.1f} tons")
+        # 1. Display Total Lifetime Metric
+        st.metric(
+            label="Total Estimated Lifetime CO2e", 
+            value=f"{detailed['total_lifetime']:.1f} tons",
+            help="This total is calculated based on the Manufacturing phase and the Use Phase fuel/energy consumption over the estimated period."
+        )
+
+        # 2. Prepare data for bar chart
+        # Using the base use-phase total (70% of mid-point estimate) for clear comparison.
+        chart_data = pd.DataFrame({
+            "Category": ["Manufacturing (30%)", "Fuel/Energy Use (70% Base)"],
+            "CO2e Tons": [detailed['manufacturing'], detailed['use_phase_total_base']]
+        })
+        
+        # 3. Display Bar Chart
+        st.markdown("##### Lifecycle Carbon Footprint Breakdown")
+        st.bar_chart(chart_data.set_index("Category"))
+        
+        # 4. Display Annual and Per Mile metrics (simplified)
+        st.markdown("---")
+        st.markdown("##### Detailed Metrics")
+        d_col1, d_col2 = st.columns(2)
+        d_col1.metric("Annual Emissions", f"{detailed['annual_emissions']:.1f} tons/yr")
+        d_col2.metric("Per Mile Emissions", f"{detailed['per_mile_g']:.0f} g/mile")
